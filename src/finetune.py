@@ -63,7 +63,10 @@ def main():
 
     dataset = load_dataset("json", data_files=DATA_PATH, split="train")
 
-    training_args = SFTConfig(
+    # SFTConfig's accepted kwargs have changed across trl versions (e.g.
+    # max_seq_length -> max_length). Build the base args, then add the
+    # length-limit kwarg under whichever name this installed version wants.
+    base_kwargs = dict(
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
         per_device_train_batch_size=2,
@@ -74,9 +77,15 @@ def main():
         bf16=torch.cuda.is_available(),
         report_to="wandb" if USE_WANDB else "none",
         run_name="paper-rag-lora" if USE_WANDB else None,
-        max_seq_length=1024,
-        dataset_text_field=None,  # using chat-formatted "messages" field
     )
+    try:
+        training_args = SFTConfig(max_length=1024, **base_kwargs)
+    except TypeError:
+        try:
+            training_args = SFTConfig(max_seq_length=1024, **base_kwargs)
+        except TypeError:
+            # Neither kwarg accepted on this version — fall back to default length.
+            training_args = SFTConfig(**base_kwargs)
 
     trainer = SFTTrainer(
         model=model,
