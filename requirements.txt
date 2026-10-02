@@ -1,11 +1,31 @@
-transformers==4.44.2
-peft==0.12.0
-bitsandbytes==0.43.3
+transformers>=4.44.0
+peft>=0.12.0
+bitsandbytes>=0.43.0
 trl==0.9.6
-accelerate==0.33.0
+accelerate>=0.33.0
 sentence-transformers>=3.0.0
 chromadb>=0.5.0
 pypdf>=4.3.0
-datasets==2.20.0
+datasets>=2.20.0
 wandb>=0.17.0
 torch>=2.3.0
+
+# trl is pinned exactly (not >=): newer trl releases added an experimental
+# "chunked cross-entropy" patch to SFTTrainer that crashes on some
+# PEFT+4-bit model setups with
+# `AttributeError: 'functools.partial' object has no attribute '__func__'`.
+# trl==0.9.6 predates that feature entirely.
+#
+# Everything else is left as a floor (>=), not pinned exact, on purpose:
+# bitsandbytes/transformers/accelerate/torch ship CUDA-version-specific
+# binaries, and Kaggle/Colab pre-install versions matched to their own
+# CUDA driver. Pinning these to an older exact version, or reinstalling
+# with --upgrade, can silently replace the platform's matched torch/
+# bitsandbytes build with an incompatible one (seen as "Could not find
+# the bitsandbytes CUDA binary", `ModuleNotFoundError: No module named
+# 'triton.ops'`, or a torchcodec/ffmpeg load error after torch gets
+# upgraded to a build Kaggle didn't ship). If a fresh install ever
+# breaks bitsandbytes again, use `pip install --no-deps --force-reinstall
+# bitsandbytes` (never --upgrade) so pip can't touch torch, and always
+# recheck `python -c "import torch; print(torch.__version__,
+# torch.cuda.is_available())"` right after any pip install.
