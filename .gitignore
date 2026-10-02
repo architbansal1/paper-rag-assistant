@@ -1,0 +1,14 @@
+# Data / models (large, regenerate via scripts)
+data/papers/*.pdf
+data/chroma_db/
+models/
+eval/results_*.json
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Env
+.env
+wandb/
