@@ -9,21 +9,12 @@ otherwise falls back to local logging only.
 """
 import os
 import json
+import inspect
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
-
-# Note on a trl/transformers version interaction, in case this resurfaces:
-# trl's SFTTrainer applies an internal "chunked cross-entropy" patch to the
-# model's forward method. transformers>=4.51.0 wraps decoder-layer forward
-# calls in functools.partial (for a flash-attention kwargs feature), which
-# that trl patch doesn't expect, causing
-# `AttributeError: 'functools.partial' object has no attribute '__func__'`.
-# Fixed by pinning transformers<4.51.0 in requirements.txt rather than
-# disabling the patch — disabling it instead breaks SFTTrainer.compute_loss,
-# which assumes the patched forward's output shape.
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "qa_pairs.jsonl")
@@ -65,25 +56,15 @@ def build_lora_config():
     )
 
 
-def main():
-    model, tokenizer = load_model_and_tokenizer()
-    lora_config = build_lora_config()
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+def build_training_args():
+    # SFTConfig's accepted kwargs have drifted across trl versions (e.g.
+    # max_seq_length -> max_length, and a loss_type option was added).
+    # Rather than guess-and-check with nested try/excepts, inspect what
+    # this installed version's SFTConfig actually accepts and only pass
+    # the kwargs it supports.
+    params = inspect.signature(SFTConfig.__init__).parameters
 
-    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
-
-    # qa_pairs.jsonl stores each example as {"messages": [...]} (chat format).
-    # Newer trl auto-detects that column; trl==0.9.6 (pinned here for the
-    # chunked-CE compatibility fix) doesn't, and needs an explicit
-    # formatting_func that turns each example into one training string.
-    def formatting_func(example):
-        return tokenizer.apply_chat_template(example["messages"], tokenize=False)
-
-    # SFTConfig's accepted kwargs have changed across trl versions (e.g.
-    # max_seq_length -> max_length). Build the base args, then add the
-    # length-limit kwarg under whichever name this installed version wants.
-    base_kwargs = dict(
+    kwargs = dict(
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
         per_device_train_batch_size=2,
@@ -95,40 +76,66 @@ def main():
         report_to="wandb" if USE_WANDB else "none",
         run_name="paper-rag-lora" if USE_WANDB else None,
     )
-    try:
-        training_args = SFTConfig(max_length=1024, **base_kwargs)
-    except TypeError:
-        try:
-            training_args = SFTConfig(max_seq_length=1024, **base_kwargs)
-        except TypeError:
-            # Neither kwarg accepted on this version — fall back to default length.
-            training_args = SFTConfig(**base_kwargs)
 
+    if "max_length" in params:
+        kwargs["max_length"] = 1024
+    elif "max_seq_length" in params:
+        kwargs["max_seq_length"] = 1024
+
+    # Default loss_type on recent trl is "chunked_nll" — a memory-saving
+    # optimization that patches the model's forward method internally.
+    # On some transformers versions that patch crashes with
+    # AttributeError: 'functools.partial' object has no attribute
+    # '__func__' (transformers wraps internal forward calls in
+    # functools.partial for an unrelated kwargs-forwarding feature, which
+    # trl's patch doesn't expect). Plain "nll" is the standard, fully
+    # supported loss and sidesteps that patch entirely — we don't need
+    # the chunked memory optimization for a 1.5B model on a T4.
+    if "loss_type" in params:
+        kwargs["loss_type"] = "nll"
+
+    return SFTConfig(**kwargs)
+
+
+def build_trainer(model, tokenizer, dataset, training_args, formatting_func):
     # SFTTrainer's tokenizer/processor kwarg name has also changed across
-    # trl versions (tokenizer -> processing_class). Same tolerant pattern
-    # as the SFTConfig length kwarg above.
-    try:
-        trainer = SFTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=dataset,
-            processing_class=tokenizer,
-            formatting_func=formatting_func,
-        )
-    except TypeError:
-        trainer = SFTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=dataset,
-            tokenizer=tokenizer,
-            formatting_func=formatting_func,
-        )
+    # trl versions (tokenizer -> processing_class). Same inspect-based
+    # approach as build_training_args above.
+    params = inspect.signature(SFTTrainer.__init__).parameters
+    tokenizer_kwarg = "processing_class" if "processing_class" in params else "tokenizer"
+
+    return SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        formatting_func=formatting_func,
+        **{tokenizer_kwarg: tokenizer},
+    )
+
+
+def main():
+    model, tokenizer = load_model_and_tokenizer()
+    lora_config = build_lora_config()
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
+
+    # qa_pairs.jsonl stores each example as {"messages": [...]} (chat
+    # format). Older trl versions don't auto-detect that column, so we
+    # pass an explicit formatting_func that turns each example into one
+    # training string via the tokenizer's own chat template.
+    def formatting_func(example):
+        return tokenizer.apply_chat_template(example["messages"], tokenize=False)
+
+    training_args = build_training_args()
+    trainer = build_trainer(model, tokenizer, dataset, training_args, formatting_func)
 
     trainer.train()
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"LoRA adapter saved to {OUTPUT_DIR}")
-    
+
 
 if __name__ == "__main__":
     main()
