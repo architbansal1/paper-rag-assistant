@@ -15,19 +15,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
-import trl.trainer.sft_trainer as _sft_trainer_module
-
-# A newer trl release added an experimental "chunked cross-entropy" patch
-# applied inside SFTTrainer.__init__. On some PEFT + 4-bit model setups it
-# crashes with AttributeError: 'functools.partial' object has no attribute
-# '__func__' before training even starts. Rather than pin trl to an old
-# version (which then falls out of sync with transformers' own kwarg names,
-# e.g. tokenizer -> processing_class, and breaks in a different way), just
-# disable that one internal patch function. Training still works correctly
-# without it — it's a memory-optimization patch, not something our small
-# 1.5B model + LoRA setup needs on a T4.
-if hasattr(_sft_trainer_module, "_patch_chunked_ce_lm_head"):
-    _sft_trainer_module._patch_chunked_ce_lm_head = lambda *args, **kwargs: None
+# Note on a trl/transformers version interaction, in case this resurfaces:
+# trl's SFTTrainer applies an internal "chunked cross-entropy" patch to the
+# model's forward method. transformers>=4.51.0 wraps decoder-layer forward
+# calls in functools.partial (for a flash-attention kwargs feature), which
+# that trl patch doesn't expect, causing
+# `AttributeError: 'functools.partial' object has no attribute '__func__'`.
+# Fixed by pinning transformers<4.51.0 in requirements.txt rather than
+# disabling the patch — disabling it instead breaks SFTTrainer.compute_loss,
+# which assumes the patched forward's output shape.
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "qa_pairs.jsonl")
