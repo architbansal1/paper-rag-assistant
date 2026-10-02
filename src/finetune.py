@@ -87,13 +87,23 @@ def main():
             # Neither kwarg accepted on this version — fall back to default length.
             training_args = SFTConfig(**base_kwargs)
 
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-    )
-
+        # SFTTrainer's tokenizer/processor kwarg name has also changed across
+    # trl versions (tokenizer -> processing_class). Same tolerant pattern
+    # as the SFTConfig length kwarg above.
+    try:
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+    except TypeError:
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            tokenizer=tokenizer,
+        )
     trainer.train()
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
