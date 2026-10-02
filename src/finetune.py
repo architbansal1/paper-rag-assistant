@@ -63,6 +63,13 @@ def main():
 
     dataset = load_dataset("json", data_files=DATA_PATH, split="train")
 
+    # qa_pairs.jsonl stores each example as {"messages": [...]} (chat format).
+    # Newer trl auto-detects that column; trl==0.9.6 (pinned here for the
+    # chunked-CE compatibility fix) doesn't, and needs an explicit
+    # formatting_func that turns each example into one training string.
+    def formatting_func(example):
+        return tokenizer.apply_chat_template(example["messages"], tokenize=False)
+
     # SFTConfig's accepted kwargs have changed across trl versions (e.g.
     # max_seq_length -> max_length). Build the base args, then add the
     # length-limit kwarg under whichever name this installed version wants.
@@ -87,7 +94,7 @@ def main():
             # Neither kwarg accepted on this version — fall back to default length.
             training_args = SFTConfig(**base_kwargs)
 
-        # SFTTrainer's tokenizer/processor kwarg name has also changed across
+    # SFTTrainer's tokenizer/processor kwarg name has also changed across
     # trl versions (tokenizer -> processing_class). Same tolerant pattern
     # as the SFTConfig length kwarg above.
     try:
@@ -96,6 +103,7 @@ def main():
             args=training_args,
             train_dataset=dataset,
             processing_class=tokenizer,
+            formatting_func=formatting_func,
         )
     except TypeError:
         trainer = SFTTrainer(
@@ -103,12 +111,14 @@ def main():
             args=training_args,
             train_dataset=dataset,
             tokenizer=tokenizer,
+            formatting_func=formatting_func,
         )
+
     trainer.train()
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"LoRA adapter saved to {OUTPUT_DIR}")
-
+    
 
 if __name__ == "__main__":
     main()
