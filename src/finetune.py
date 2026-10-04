@@ -66,10 +66,10 @@ def build_training_args():
 
     kwargs = dict(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
+        num_train_epochs=6,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        learning_rate=2e-4,
+        learning_rate=1e-4,
         logging_steps=5,
         save_strategy="epoch",
         bf16=torch.cuda.is_available(),
