@@ -1,24 +1,35 @@
 """
-LoRA fine-tune a small open model on data/qa_pairs.jsonl.
+LoRA / QLoRA fine-tune a small open model on the paper Q&A pairs.
 
-Designed to run on a free-tier Colab/Kaggle T4 GPU (16GB).
-Model: Qwen2.5-1.5B-Instruct (small enough to fine-tune comfortably on T4).
+Changes vs. the first version:
+  * Loss is computed on the ASSISTANT TOKENS ONLY (prompt/completion format),
+    instead of on the whole chat-templated string.
+  * Training data = data/qa_pairs.jsonl + data/qa_pairs_extra.jsonl.
+  * CLI flags for seed / epochs / lr / output dir, so several seeds can be run
+    with identical settings.
+  * Optional --rag: train on prompts that contain retrieved excerpts, in the
+    same format eval.py --rag uses (see src/rag_prompt.py).
 
-Logs to Weights & Biases if WANDB_API_KEY is set in the environment;
-otherwise falls back to local logging only.
+Designed to run on a free-tier Kaggle/Colab T4 (16GB).
+Logs to Weights & Biases if WANDB_API_KEY is set; otherwise local only.
 """
 import os
 import json
 import inspect
+import argparse
 import torch
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "qa_pairs.jsonl")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "lora-adapter")
+DATA_PATHS = [
+    os.path.join(HERE, "..", "data", "qa_pairs.jsonl"),
+    os.path.join(HERE, "..", "data", "qa_pairs_extra.jsonl"),
+]
+DEFAULT_OUTPUT_DIR = os.path.join(HERE, "..", "models", "lora-adapter")
 
 USE_WANDB = bool(os.environ.get("WANDB_API_KEY"))
 
@@ -44,8 +55,6 @@ def load_model_and_tokenizer():
 
 
 def build_lora_config():
-    # Targets the attention projection matrices — see data/qa_pairs.jsonl's
-    # own LoRA Q&A pair for why these layers specifically.
     return LoraConfig(
         r=16,
         lora_alpha=32,
@@ -56,85 +65,120 @@ def build_lora_config():
     )
 
 
-def build_training_args():
-    # SFTConfig's accepted kwargs have drifted across trl versions (e.g.
-    # max_seq_length -> max_length, and a loss_type option was added).
-    # Rather than guess-and-check with nested try/excepts, inspect what
-    # this installed version's SFTConfig actually accepts and only pass
-    # the kwargs it supports.
+def load_examples(rag: bool, k: int) -> Dataset:
+    """Read every available Q&A file and convert to prompt/completion format.
+
+    prompt     = [user message]       (optionally with retrieved excerpts)
+    completion = [assistant message]
+    TRL then applies the chat template and masks the prompt, so the loss only
+    covers the assistant's answer.
+    """
+    retriever = None
+    if rag:
+        from retrieve import Retriever
+        from rag_prompt import build_rag_user_message
+        retriever = Retriever()
+
+    rows = []
+    for path in DATA_PATHS:
+        if not os.path.exists(path):
+            print(f"[data] skipping missing file {os.path.basename(path)}")
+            continue
+        n_before = len(rows)
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                msgs = json.loads(line)["messages"]
+                question, answer = msgs[0]["content"], msgs[1]["content"]
+                if rag:
+                    question = build_rag_user_message(question, retriever, k=k)
+                rows.append({
+                    "prompt": [{"role": "user", "content": question}],
+                    "completion": [{"role": "assistant", "content": answer}],
+                })
+        print(f"[data] {os.path.basename(path)}: {len(rows) - n_before} examples")
+    print(f"[data] total training examples: {len(rows)}")
+    return Dataset.from_list(rows)
+
+
+def build_training_args(args):
+    # SFTConfig's accepted kwargs drift across trl versions, so only pass
+    # what the installed version supports.
     params = inspect.signature(SFTConfig.__init__).parameters
+    max_len = 2048 if args.rag else 1024
 
     kwargs = dict(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=6,
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        learning_rate=1e-4,
+        learning_rate=args.lr,
         logging_steps=5,
-        save_strategy="epoch",
+        save_strategy="no",
+        seed=args.seed,
         bf16=torch.cuda.is_available(),
         report_to="wandb" if USE_WANDB else "none",
-        run_name="paper-rag-lora" if USE_WANDB else None,
+        run_name=f"paper-rag-lora-{'rag' if args.rag else 'closed'}-s{args.seed}" if USE_WANDB else None,
     )
 
     if "max_length" in params:
-        kwargs["max_length"] = 1024
+        kwargs["max_length"] = max_len
     elif "max_seq_length" in params:
-        kwargs["max_seq_length"] = 1024
+        kwargs["max_seq_length"] = max_len
 
-    # Default loss_type on recent trl is "chunked_nll" — a memory-saving
-    # optimization that patches the model's forward method internally.
-    # On some transformers versions that patch crashes with
-    # AttributeError: 'functools.partial' object has no attribute
-    # '__func__' (transformers wraps internal forward calls in
-    # functools.partial for an unrelated kwargs-forwarding feature, which
-    # trl's patch doesn't expect). Plain "nll" is the standard, fully
-    # supported loss and sidesteps that patch entirely — we don't need
-    # the chunked memory optimization for a 1.5B model on a T4.
+    # Plain "nll" avoids the chunked_nll crash on some transformers versions.
     if "loss_type" in params:
         kwargs["loss_type"] = "nll"
+
+    # Loss on completion tokens only (this is already the default for
+    # prompt/completion data in recent trl, but be explicit when supported).
+    if "completion_only_loss" in params:
+        kwargs["completion_only_loss"] = True
 
     return SFTConfig(**kwargs)
 
 
-def build_trainer(model, tokenizer, dataset, training_args, formatting_func):
-    # SFTTrainer's tokenizer/processor kwarg name has also changed across
-    # trl versions (tokenizer -> processing_class). Same inspect-based
-    # approach as build_training_args above.
+def build_trainer(model, tokenizer, dataset, training_args):
     params = inspect.signature(SFTTrainer.__init__).parameters
     tokenizer_kwarg = "processing_class" if "processing_class" in params else "tokenizer"
-
     return SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        formatting_func=formatting_func,
         **{tokenizer_kwarg: tokenizer},
     )
 
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--epochs", type=float, default=3)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--rag", action="store_true", help="train on prompts that include retrieved excerpts")
+    p.add_argument("--k", type=int, default=3, help="number of retrieved chunks when --rag")
+    p.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    print(f"[config] seed={args.seed} epochs={args.epochs} lr={args.lr} rag={args.rag} -> {args.output_dir}")
+    set_seed(args.seed)
+
+    dataset = load_examples(args.rag, args.k)  # before the model, so retrieval gets the GPU/CPU to itself
+
     model, tokenizer = load_model_and_tokenizer()
-    lora_config = build_lora_config()
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, build_lora_config())
     model.print_trainable_parameters()
 
-    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
-
-    # qa_pairs.jsonl stores each example as {"messages": [...]} (chat
-    # format). Older trl versions don't auto-detect that column, so we
-    # pass an explicit formatting_func that turns each example into one
-    # training string via the tokenizer's own chat template.
-    def formatting_func(example):
-        return tokenizer.apply_chat_template(example["messages"], tokenize=False)
-
-    training_args = build_training_args()
-    trainer = build_trainer(model, tokenizer, dataset, training_args, formatting_func)
+    training_args = build_training_args(args)
+    trainer = build_trainer(model, tokenizer, dataset, training_args)
 
     trainer.train()
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"LoRA adapter saved to {OUTPUT_DIR}")
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"LoRA adapter saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
