@@ -1,212 +1,147 @@
 """
-LoRA / QLoRA fine-tune a small open model on the paper Q&A pairs.
+Evaluate the base model or a LoRA adapter on the held-out eval set
+(eval/eval_set.jsonl + eval/eval_set_extra.jsonl; disjoint from training data).
 
-Changes vs. the first version:
-  * Loss is computed on the ASSISTANT TOKENS ONLY (prompt/completion format),
-    instead of on the whole chat-templated string.
-  * Training data = data/qa_pairs.jsonl + data/qa_pairs_extra.jsonl.
-  * CLI flags for seed / epochs / lr / output dir, so several seeds can be run
-    with identical settings.
-  * Optional --rag: train on prompts that contain retrieved excerpts, in the
-    same format eval.py --rag uses (see src/rag_prompt.py).
+Per question we record:
+  * cosine similarity between the answer and the reference (MiniLM judge model)
+  * a refusal flag, so a refusal counts as a failure instead of a quiet low score
+  * the full answer, so transcripts can be read or LLM-graded (src/judge.py)
 
-Designed to run on a free-tier Kaggle/Colab T4 (16GB).
-Logs to Weights & Biases if WANDB_API_KEY is set; otherwise local only.
+Each run is written to eval/runs/<tag>.json; src/report.py aggregates runs.
+
+Usage:
+  python src/eval.py --tag base_closed
+  python src/eval.py --rag --tag base_rag
+  python src/eval.py --adapter models/ft_closed_s1 --tag ft_closed__s1
+  python src/eval.py --adapter models/ft_rag_s1 --rag --tag ft_rag__s1
 """
 import os
+import re
 import json
-import inspect
 import argparse
 import torch
-from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+from sentence_transformers import SentenceTransformer, util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-DATA_PATHS = [
-    os.path.join(HERE, "..", "data", "qa_pairs.jsonl"),
-    os.path.join(HERE, "..", "data", "qa_pairs_extra.jsonl"),
+BASE_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+EVAL_PATHS = [
+    os.path.join(HERE, "..", "eval", "eval_set.jsonl"),
+    os.path.join(HERE, "..", "eval", "eval_set_extra.jsonl"),
 ]
-DEFAULT_OUTPUT_DIR = os.path.join(HERE, "..", "models", "lora-adapter")
+RUNS_DIR = os.path.join(HERE, "..", "eval", "runs")
+JUDGE_EMBED_MODEL = "all-MiniLM-L6-v2"
 
-USE_WANDB = bool(os.environ.get("WANDB_API_KEY"))
-
-
-def patch_trl_kernel_for_old_gpus():
-    """Work around a TRL crash on GPUs with compute capability < 8.0 (e.g. T4).
-
-    trl/kernels/chunked_logprob.py calls torch.addmm(..., out_dtype=float32)
-    with bf16 inputs whenever PyTorch >= 2.8, without checking the GPU. On a
-    T4 (capability 7.5) that raises:
-      RuntimeError: gemm input type at::BFloat16 and output type float is only
-      supported for CUDA devices with compute capability 8.0 or higher
-    We swap in the plain fp32 upcast path, which is what TRL itself falls back
-    to on other setups. No-op on newer GPUs or if the module doesn't exist.
-    """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] >= 8:
-        return
-    try:
-        import trl.kernels.chunked_logprob as clp
-    except Exception:
-        return
-
-    def _addmm_fp32_compat(acc, a, b):
-        acc.addmm_(a.float(), b.float())
-
-    if hasattr(clp, "_addmm_fp32"):
-        clp._addmm_fp32 = _addmm_fp32_compat
-        print("[patch] using fp32 upcast addmm in trl chunked_logprob (GPU capability < 8.0)")
+_REFUSAL_START = re.compile(
+    r"^\s*(i'?m sorry|i am sorry|sorry|i apologi[sz]e|i can(?:no|')t (?:assist|help|answer|provide)|i cannot (?:assist|help|answer|provide)|i'?m unable|i am unable)",
+    re.IGNORECASE,
+)
+_REFUSAL_ANY = re.compile(
+    r"(can'?t|cannot|unable to|not able to) (assist|help)( with)?( that| this)?", re.IGNORECASE
+)
 
 
-def load_model_and_tokenizer():
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
+def is_refusal(answer: str) -> bool:
+    """Heuristic: starts with a refusal phrase, or is short and contains one."""
+    if _REFUSAL_START.search(answer):
+        return True
+    return len(answer.split()) < 30 and bool(_REFUSAL_ANY.search(answer))
+
+
+def load_eval_set():
+    items = []
+    for path in EVAL_PATHS:
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            items += [json.loads(line) for line in f if line.strip()]
+    return items
+
+
+def generate(model, tokenizer, user_message: str, max_new_tokens=200) -> str:
+    messages = [{"role": "user", "content": user_message}]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        quantization_config=bnb_config,
-        device_map="auto",
-    )
-    model = prepare_model_for_kbit_training(model)
-    return model, tokenizer
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,  # greedy, for reproducible eval
+        )
+    text = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    return text.strip()
 
 
-def build_lora_config():
-    return LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-
-
-def load_examples(rag: bool, k: int) -> Dataset:
-    """Read every available Q&A file and convert to prompt/completion format.
-
-    prompt     = [user message]       (optionally with retrieved excerpts)
-    completion = [assistant message]
-    TRL then applies the chat template and masks the prompt, so the loss only
-    covers the assistant's answer.
-    """
+def run_eval(adapter_path, rag: bool, k: int, tag: str, max_new_tokens: int):
     retriever = None
     if rag:
         from retrieve import Retriever
         from rag_prompt import build_rag_user_message
         retriever = Retriever()
 
-    rows = []
-    for path in DATA_PATHS:
-        if not os.path.exists(path):
-            print(f"[data] skipping missing file {os.path.basename(path)}")
-            continue
-        n_before = len(rows)
-        with open(path) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                msgs = json.loads(line)["messages"]
-                question, answer = msgs[0]["content"], msgs[1]["content"]
-                if rag:
-                    question = build_rag_user_message(question, retriever, k=k)
-                rows.append({
-                    "prompt": [{"role": "user", "content": question}],
-                    "completion": [{"role": "assistant", "content": answer}],
-                })
-        print(f"[data] {os.path.basename(path)}: {len(rows) - n_before} examples")
-    print(f"[data] total training examples: {len(rows)}")
-    return Dataset.from_list(rows)
-
-
-def build_training_args(args):
-    # SFTConfig's accepted kwargs drift across trl versions, so only pass
-    # what the installed version supports.
-    params = inspect.signature(SFTConfig.__init__).parameters
-    max_len = 2048 if args.rag else 1024
-
-    kwargs = dict(
-        output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
-        learning_rate=args.lr,
-        logging_steps=5,
-        save_strategy="no",
-        seed=args.seed,
-        bf16=torch.cuda.is_available(),
-        report_to="wandb" if USE_WANDB else "none",
-        run_name=f"paper-rag-lora-{'rag' if args.rag else 'closed'}-s{args.seed}" if USE_WANDB else None,
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, torch_dtype=torch.bfloat16, device_map="auto"
     )
+    label = "base"
+    if adapter_path:
+        model = PeftModel.from_pretrained(model, adapter_path)
+        label = "fine-tuned"
+    model.eval()
 
-    if "max_length" in params:
-        kwargs["max_length"] = max_len
-    elif "max_seq_length" in params:
-        kwargs["max_seq_length"] = max_len
+    judge = SentenceTransformer(JUDGE_EMBED_MODEL)
+    eval_set = load_eval_set()
 
-    # Plain "nll" avoids the chunked_nll crash on some transformers versions.
-    if "loss_type" in params:
-        kwargs["loss_type"] = "nll"
+    results, sims, refusals = [], [], 0
+    for item in eval_set:
+        question = item["messages"][0]["content"]
+        reference = item["messages"][1]["content"]
+        user_message = build_rag_user_message(question, retriever, k=k) if rag else question
+        answer = generate(model, tokenizer, user_message, max_new_tokens=max_new_tokens)
 
-    # Loss on completion tokens only (this is already the default for
-    # prompt/completion data in recent trl, but be explicit when supported).
-    if "completion_only_loss" in params:
-        kwargs["completion_only_loss"] = True
+        sim = util.cos_sim(judge.encode(answer), judge.encode(reference)).item()
+        refused = is_refusal(answer)
+        sims.append(sim)
+        refusals += int(refused)
+        results.append({
+            "question": question,
+            "paper": item.get("paper"),
+            "reference": reference,
+            "answer": answer,
+            "similarity": round(sim, 4),
+            "refusal": refused,
+        })
+        flag = "  <-- REFUSAL" if refused else ""
+        print(f"[{tag}] sim={sim:.3f}  Q: {question[:60]}...{flag}")
 
-    return SFTConfig(**kwargs)
+    avg_sim = sum(sims) / len(sims)
+    print(f"\n{tag} ({label}, rag={rag}) — n={len(sims)}  avg cosine={avg_sim:.4f}  refusals={refusals}")
 
-
-def build_trainer(model, tokenizer, dataset, training_args):
-    params = inspect.signature(SFTTrainer.__init__).parameters
-    tokenizer_kwarg = "processing_class" if "processing_class" in params else "tokenizer"
-    return SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        **{tokenizer_kwarg: tokenizer},
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    out_path = os.path.join(RUNS_DIR, f"{tag}.json")
+    with open(out_path, "w") as f:
+        json.dump({
+            "tag": tag, "label": label, "adapter": adapter_path, "rag": rag, "k": k if rag else None,
+            "n": len(sims), "average_similarity": avg_sim, "refusals": refusals, "results": results,
+        }, f, indent=2)
+    print(f"Saved {out_path}")
+    print(
+        "Note: cosine similarity is a proxy; read the transcripts or run src/judge.py "
+        "before trusting any aggregate."
     )
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--epochs", type=float, default=3)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--rag", action="store_true", help="train on prompts that include retrieved excerpts")
-    p.add_argument("--k", type=int, default=3, help="number of retrieved chunks when --rag")
-    p.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    print(f"[config] seed={args.seed} epochs={args.epochs} lr={args.lr} rag={args.rag} -> {args.output_dir}")
-    set_seed(args.seed)
-    patch_trl_kernel_for_old_gpus()
-
-    dataset = load_examples(args.rag, args.k)  # before the model, so retrieval gets the GPU/CPU to itself
-
-    model, tokenizer = load_model_and_tokenizer()
-    model = get_peft_model(model, build_lora_config())
-    model.print_trainable_parameters()
-
-    training_args = build_training_args(args)
-    trainer = build_trainer(model, tokenizer, dataset, training_args)
-
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"LoRA adapter saved to {args.output_dir}")
+    return avg_sim
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--adapter", type=str, default=None, help="LoRA adapter path; omit for the base model")
+    parser.add_argument("--rag", action="store_true", help="put retrieved excerpts in the prompt")
+    parser.add_argument("--k", type=int, default=3, help="retrieved chunks when --rag")
+    parser.add_argument("--tag", type=str, default=None, help="run name; also the output filename")
+    parser.add_argument("--max-new-tokens", type=int, default=200)
+    args = parser.parse_args()
+    tag = args.tag or (("ft" if args.adapter else "base") + ("_rag" if args.rag else "_closed"))
+    run_eval(args.adapter, args.rag, args.k, tag, args.max_new_tokens)
