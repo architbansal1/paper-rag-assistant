@@ -34,6 +34,32 @@ DEFAULT_OUTPUT_DIR = os.path.join(HERE, "..", "models", "lora-adapter")
 USE_WANDB = bool(os.environ.get("WANDB_API_KEY"))
 
 
+def patch_trl_kernel_for_old_gpus():
+    """Work around a TRL crash on GPUs with compute capability < 8.0 (e.g. T4).
+
+    trl/kernels/chunked_logprob.py calls torch.addmm(..., out_dtype=float32)
+    with bf16 inputs whenever PyTorch >= 2.8, without checking the GPU. On a
+    T4 (capability 7.5) that raises:
+      RuntimeError: gemm input type at::BFloat16 and output type float is only
+      supported for CUDA devices with compute capability 8.0 or higher
+    We swap in the plain fp32 upcast path, which is what TRL itself falls back
+    to on other setups. No-op on newer GPUs or if the module doesn't exist.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] >= 8:
+        return
+    try:
+        import trl.kernels.chunked_logprob as clp
+    except Exception:
+        return
+
+    def _addmm_fp32_compat(acc, a, b):
+        acc.addmm_(a.float(), b.float())
+
+    if hasattr(clp, "_addmm_fp32"):
+        clp._addmm_fp32 = _addmm_fp32_compat
+        print("[patch] using fp32 upcast addmm in trl chunked_logprob (GPU capability < 8.0)")
+
+
 def load_model_and_tokenizer():
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -165,6 +191,7 @@ def main():
     args = parse_args()
     print(f"[config] seed={args.seed} epochs={args.epochs} lr={args.lr} rag={args.rag} -> {args.output_dir}")
     set_seed(args.seed)
+    patch_trl_kernel_for_old_gpus()
 
     dataset = load_examples(args.rag, args.k)  # before the model, so retrieval gets the GPU/CPU to itself
 
